@@ -182,7 +182,7 @@ class E2E(torch.nn.Module):
 
         if enc_mask is not None:
             enc_mask = enc_mask[:, :hs_mask.shape[2], :hs_mask.shape[2]]
-        enc_mask = enc_mask & hs_mask if enc_mask is not None else hs_mask
+        enc_mask = enc_mask & hs_mask if enc_mask is not None else hs_mask # chunk mask and padding mask
         hs_pad, _ = self.encoder.encoders(xs, enc_mask)
         if self.encoder.normalize_before:
             hs_pad = self.encoder.after_norm(hs_pad)
@@ -193,7 +193,7 @@ class E2E(torch.nn.Module):
         y_len = max([len(y) for y in ys])
         ys_pad = ys_pad[:, :y_len]
         if dec_mask is not None:
-            dec_mask = dec_mask[:, :y_len+1, :hs_pad.shape[1]]
+            dec_mask = dec_mask[:, :y_len+1, :hs_pad.shape[1]] # len + 1 is for eos prediction
         self.hs_pad = hs_pad
         batch_size = xs_pad.size(0)
         if self.mtlalpha == 0.0:
@@ -204,10 +204,10 @@ class E2E(torch.nn.Module):
             loss_ctc = self.ctc(hs_pad.view(batch_size, -1, self.adim), hs_len, ys_pad)
 
         # trigger mask
-        hs_mask = hs_mask & dec_mask if dec_mask is not None else hs_mask
+        hs_mask = hs_mask & dec_mask if dec_mask is not None else hs_mask #对齐点的chunk mask 和 padding mask
         # 2. forward decoder
         ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos, self.ignore_id)
-        ys_mask = target_mask(ys_in_pad, self.ignore_id)
+        ys_mask = target_mask(ys_in_pad, self.ignore_id) # y self atten 的上三角mask 和 padding mask
         pred_pad, pred_mask = self.decoder(ys_in_pad, ys_mask, hs_pad, hs_mask)
         self.pred_pad = pred_pad
 
@@ -239,6 +239,26 @@ class E2E(torch.nn.Module):
         return dict(decoder=self.decoder, ctc=CTCPrefixScorer(self.ctc, self.eos))
 
     def encode(self, x, mask=None):
+        """Encode acoustic features.
+
+        :param ndarray x: source acoustic feature (T, D)
+        :return: encoder outputs
+        :rtype: torch.Tensor
+        """
+        self.eval()
+        x = torch.as_tensor(x).unsqueeze(0)
+        if mask is not None:
+            mask = mask
+        if isinstance(self.encoder.embed, EncoderConv2d):
+            hs, _ = self.encoder.embed(x, torch.Tensor([float(x.shape[1])]))
+        else:
+            hs, _ = self.encoder.embed(x, None)
+        hs, _ = self.encoder.encoders(hs, mask)
+        if self.encoder.normalize_before:
+            hs = self.encoder.after_norm(hs)
+        return hs.squeeze(0)
+
+    def encode0(self, x, mask=None):
         """Encode acoustic features.
 
         :param ndarray x: source acoustic feature (T, D)
@@ -476,11 +496,11 @@ class E2E(torch.nn.Module):
 
         if train_args.chunk:
             s = np.arange(0, seq_len, train_args.chunk_size)
-            mask = adaptive_enc_mask(seq_len, s).unsqueeze(0)
+            mask = adaptive_enc_mask(seq_len, s).unsqueeze(0) # chunk mask
         else:
             mask = turncated_mask(1, seq_len, train_args.left_window, train_args.right_window)
         enc_output = self.encode(x, mask).unsqueeze(0)
-        lpz = torch.nn.functional.softmax(self.ctc.ctc_lo(enc_output), dim=-1)
+        lpz = torch.nn.functional.softmax(self.ctc.ctc_lo(enc_output), dim=-1) #ctc 得分 分布
         lpz = lpz.squeeze(0)
 
         h = enc_output.squeeze(0)
@@ -504,10 +524,10 @@ class E2E(torch.nn.Module):
         minlen = int(recog_args.minlenratio * h.size(0))
         hyp = {'score': 0.0, 'yseq': [y], 'rnnlm_prev': None, 'seq': char_list[y],
                'last_time': [], "ctc_score": 0.0,  "rnnlm_score": 0.0, "att_score": 0.0,
-               "cache": None, "precache": None, "preatt_score": 0.0, "prev_score":0.0}
+               "cache": None, "precache": None, "preatt_score": 0.0, "prev_score":0.0} #每条路径的数据结构格式
 
-        hyps = {char_list[y]: hyp}
-        hyps_att = {char_list[y]: hyp}
+        hyps = {char_list[y]: hyp} # 初始字典，只有键 sos； 用来保留：总得分比较高，留下来的候选路径
+        hyps_att = {char_list[y]: hyp} # 初始字典，只有键 sos
         Pb_prev, Pnb_prev = Counter(), Counter()
         Pb, Pnb = Counter(), Counter()
         Pjoint = Counter()
@@ -515,68 +535,80 @@ class E2E(torch.nn.Module):
         vocab_size = lpz.shape[1]
         r = np.ndarray((vocab_size), dtype=np.float32)
         l = char_list[y]
-        Pb_prev[l] = 1
-        Pnb_prev[l] = 0
+        Pb_prev[l] = 1 #blank的概率
+        Pnb_prev[l] = 0 #non-blank的概率
         A_prev = [l]
         A_prev_id = [[y]]
         vy.unsqueeze(1)
         total_copy = time.time() - time.time()
         samelen = 0
-        hat_att = {}
+        hat_att = {} #保存：ctc出现非blank节点的路径
         if mask is not None:
             chunk_pos = set(np.array(mask.sum(dim=-1))[0])
             for i in chunk_pos:
-                hat_att[i] = {}
+                hat_att[i] = {} # 当前chunk是否有需要y走一个step
         else:
             hat_att[enc_output.shape[1]] = {}
-
-        for i in range(h_len):
-            hyps_ctc = {}
-            threshold = recog_args.threshold#self.threshold #np.percentile(r, 98)
-            pos_ctc = np.where(lpz[i] > threshold)[0]
+        ##################################################################################### tmp_cache 和 cache 的差别：当前步 1 需要走attn的路径来说 前者是出了最后一个字的状态，后者是出最后一个字前的状态；2 不需要走的路径来说是一样的
+        for i in range(h_len): # hat_att 不会重置
+            hyps_ctc = {} # 重置， 这个相当一个过程的总汇总对象，每一步结束后都会给hyps
+            threshold = recog_args.threshold # self.threshold #np.percentile(r, 98)
+            pos_ctc = np.where(lpz[i] > threshold)[0] # 最高得分，且大于阈值
             #self.removeIlegal(hyps)
             if mask is not None:
-                chunk_index = mask[0][i].sum().item()
+                chunk_index = mask[0][i].sum().item() #当前步 是哪个chunk，对应的可以看的chunk（32，64，。。。
             else:
                 chunk_index = h_len
-            hyps_res = {}
-            for l, hyp in hyps.items():
-                if l in hat_att[chunk_index]:
+            if (i%32) == 0:
+                pass
+                print('debug')#for debug to check how to reslove boundary-problem
+            hyps_res = {} # 重置，保留需要往下走atten的路径
+            for l, hyp in hyps.items(): # 遍历当前备选的路径
+                if l in hat_att[chunk_index]:# 当前包内，上一步之前就存在的路径，就没必要再走atten，重复走，结果还是一样
                     hyp['tmp_cache'] = hat_att[chunk_index][l]['cache']
                     hyp['tmp_att'] = hat_att[chunk_index][l]['att_scores']
-                else:
-                    hyps_res[l] = hyp
-            tmp = self.clusterbyLength(hyps_res) # This step clusters hyps according to length dict:{length,hyps}
+                else:# 上一步增加了一个token的路径, 现在需要走atten的
+                    hyps_res[l] = hyp #当前包来说，但走到一定程度，每步返回到top路径都是一样的，hyps_res将会一直为空，直到下一包
+            tmp = self.clusterbyLength(hyps_res) # 根据备选路径的长度对hyps_res 进行聚类, 返回的是还需要继续走的路径，上一步就没有增加token的路径所在的类不返回 This step clusters hyps according to length dict:{length,hyps}
             start = time.time()
 
-            # pre-compute beam
-            self.compute_hyps(tmp,i,h_len,enc_output, hat_att[chunk_index], mask, train_args.chunk)
+            # pre-compute beam #如果hyps里面都是当前chunk已经不再增加
+            self.compute_hyps(tmp,i,h_len,enc_output, hat_att[chunk_index], mask, train_args.chunk) # tmp 里面的所有备选路径去走一步 attn decoder （基于上一步输出，纯atten decode 和ctc没关系）
             total_copy += time.time()-start
             # Assign score and tokens to hyps
             #print(hyps.keys())
-            for l, hyp in hyps.items():
-                if 'tmp_att' not in hyp:
+            for l, hyp in hyps.items(): #处理每条路径的子路径（来选5条）
+                if 'tmp_att' not in hyp: # 没走过attn， 这里不会为True
                     continue #Todo check why
-                local_att_scores = hyp['tmp_att']
+                local_att_scores = hyp['tmp_att'] #当前路径的下一步attn得分分布，如果这一帧走完，还存在，那么这里的分布都是一样的，不会变
                 local_best_scores, local_best_ids = torch.topk(local_att_scores, 5, dim=1)
                 pos_att = np.array(local_best_ids[0].cpu())
-                pos = np.union1d(pos_ctc, pos_att)
-                hyp['pos'] = pos
-
-            # pre-compute ctc beam
-            hyps_ctc_compute = self.get_ctchyps2compute(hyps,hyps_ctc,i)
+                pos = np.union1d(pos_ctc, pos_att) # 5个备选 加上 ctc最高  # 对于这步没有走atten的路径来说，这里加上pos_ctc是唯一影响它可能发生变化的因素 (不是唯一，当某一帧的ctc在pos得分很高的时候，pos的新路径也可能进入新候选)
+                # 比如对‘eos ’这个路径来说，那么在下面遍历pos时，可能有新的路径产生，会去计算attn与ctc得分，如果已经在hpys里面则不会对最终结果产生影响
+                # 或者 不完整的句子，也可能会在非0的ctc结果出来后去补全，并计算分数，看是否保留
+                # 对完整（该出几个字就出了几个字的路径）就只是多便利一个候选pos
+                hyp['pos'] = pos # 这里会把所有的路径的候选字都加到字典里面，不管这一步有没有走atten
+                #if pos_ctc != 0: # i= 12,  #array([  0]) 、 array([  0, 713])
+                #    print('debug') # for debug to check some case
+            # pre-compute ctc beam # 对第二包的第一帧，这时候已经走过一步atten了
+            hyps_ctc_compute = self.get_ctchyps2compute(hyps,hyps_ctc,i) # 筛选hyps中的一部分：不在hyps_ctc里（此时肯定为真） 且候选pos（包含了ctc候选）有0（主要不是ctc的0，而是atten的0，说明没有二次使用尖峰，但是上一步的置信度不高，也需要重新计算） 或者 有和最后一个字一样（可能二次使用尖峰）  且不是eos 
+            # 下面是解决伪尖峰
             hyps_res2 = {}
             for l, hyp in hyps_ctc_compute.items():
-                l_minus = ' '.join(l.split()[:-1])
-                if l_minus in hat_att[chunk_index]:
-                    hyp['tmp_cur_new_cache'] = hat_att[chunk_index][l_minus]['cache']
+                l_minus = ' '.join(l.split()[:-1]) # 可疑尖峰，回退一步，如果已经在hat_att，那么刚刚已经走过一步了，不用保留到hyps_res2去再走一步
+                if l_minus in hat_att[chunk_index]: # hat_att 的新包的路径已经保存了一些了，上面走了一步
+                    hyp['tmp_cur_new_cache'] = hat_att[chunk_index][l_minus]['cache'] #tmp_cur* 是上一步的状态
                     hyp['tmp_cur_att_scores'] = hat_att[chunk_index][l_minus]['att_scores']
                 else:
-                    hyps_res2[l] = hyp
+                    hyps_res2[l] = hyp # 走这里是解决 的前提是满足上面要求的 hyps_ctc_compute，候选pos有blank/eos或者有和最后一个字一样(且当前为新的包)  即可能存在边界问题的路径！！！！！
             tmp2_cluster = self.clusterbyLength(hyps_res2)
-            self.compute_hyps_ctc(tmp2_cluster,h_len,enc_output, hat_att[chunk_index], mask, train_args.chunk)
-
-            for l, hyp in hyps.items():
+            self.compute_hyps_ctc(tmp2_cluster,h_len,enc_output, hat_att[chunk_index], mask, train_args.chunk) # 走这里一般是新包的第一帧，解决尖峰问题
+            #上一行 重新计算可能有边界问题的句子（退一步）的得分和状态，放到hat_att中，且key：tmp_cur_* 放在了hyps_ctc_compute，在下面计算分数的时候用
+            #下面算当前句子得分（不包括候选）是时候会用到key：tmp_cur_*
+            #所以尖峰问题的句子，不会回退去产生新句子（hyps_ctc_compute的得来条件是可以知道，两种情况，没有必要产生新句子，只需要更新分数），但是会更新分数
+            for l, hyp in hyps.items(): # 这里的遍历主要是给 ctc得分高 而保留的路径而遍历的
+                # 对由于atten得分高而保留下来的句子而言，每一步加上ctc的相应字的得分的意义在于，很可能不完整的路径的综合得分很高的，当它走到‘对齐’的帧的时候，这个时候的ctc的分数是很有影响的，而其他非’对齐‘情形下的ctc分数是影响不大的，很小
+                # 对于ctc得分较高的句子来说，每出新字，就会走atten，或者已经存在了路径，那也会得到atten分数
                 start = time.time()
                 l_id = hyp['yseq']
                 l_end = l_id[-1]
@@ -599,8 +631,12 @@ class E2E(torch.nn.Module):
                 align[:prefix_len - 1] = hyp['last_time'][:]
                 align[-1] = i
                 pos = hyp['pos']
-                if 0 in pos or l_end in pos:
-                    if l not in hyps_ctc:
+                # 往 hyps_ctc 添加路径
+                if 0 in pos or l_end in pos: # 候选中： 有blank 或者 最后一个字相同 （如果没有blank且下一个字肯定不一样，那么当前句子肯定是需要加字的，那么之前的句子肯定就不存在了，不用保存）
+                # 有 0 在的时候，不完整的句子 综合得分高， 可以保留下来，等ctc出非0的时候，推着往前走，所以就不一定本身会留下来， 比如 '<eos> ▁AND' 的候选，综合得分都不是很高，但是本身综合得分好
+                # ，暂时就保留下来，等ctc出字了，综合得分看会不会出现高的，还不高就抛弃了
+                # 有0的，得分高的（代表eos），说明是完整的句子，得保留
+                    if l not in hyps_ctc: # 当前路径自己添加到 hyps_ctc # 如果有 blank/eos 且下一个字可能一样，那么可能就是边界的情况，该路径要留下来
                         hyps_ctc[l] = {'yseq': l_id}
                         hyps_ctc[l]['rnnlm_prev'] = hyp['rnnlm_prev']
                         hyps_ctc[l]['rnnlm_score'] = hyp['rnnlm_score']
@@ -608,8 +644,10 @@ class E2E(torch.nn.Module):
                             hyps_ctc[l]['last_time'] = [0] * prefix_len
                             hyps_ctc[l]['last_time'][:] = hyp['last_time'][:]
                             hyps_ctc[l]['last_time'][-1] = i
-                            cur_att_scores = hyps_ctc_compute[l]["tmp_cur_att_scores"]
+                            # 这里保留到hyps_ctc的句子 肯定满足上面hyps_ctc_compute的条件
+                            cur_att_scores = hyps_ctc_compute[l]["tmp_cur_att_scores"] #对于可能有尖峰问题的句子，在新包的第一次走这里时，这个key是退一步重走的，来算这句自己本身的分数用的
                             cur_new_cache = hyps_ctc_compute[l]["tmp_cur_new_cache"]
+                            # 尖峰问题的句子在这里更新自身的分数和候选，是可能在下一步发生新的路径变化的
                             hyps_ctc[l]['att_score'] = hyp['preatt_score'] + \
                                                        float(cur_att_scores[0, l_end].data)
                             hyps_ctc[l]['cur_att'] = float(cur_att_scores[0, l_end].data)
@@ -626,9 +664,13 @@ class E2E(torch.nn.Module):
                         hyps_ctc[l]['preatt_score'] = hyp['preatt_score']
                         hyps_ctc[l]['precache'] = hyp['precache']
                         hyps_ctc[l]['seq'] = hyp['seq']
-
-
-                for c in list(pos):
+                else:
+                    pass
+                    print(l) # for debug when to discard path 
+                    # 对ctc得分高的路径来说，走这里是因为遇到了非blank, 本身的路径就不会被添加到hyps_ctc中，因为候选中的ctc字即将会分数很高，被添加
+                    # 对atten得分高的路径来说， 是l_end不会出现在pos中（一种是完整的路径，出过现在的ctc字，一种是不完整的还没出现在的ctc字），（且候选也没有blank）也就是接下来肯定不会重复字的路径，肯定是不完整的，对它来说，它在下面的循环中会有更完整的路径出现且保留 ！！！
+                    # atten得分高但是不走这里的else来说，有可能是不需要出下一个字的，所以本身要留下来，看后面有没有置信度更高的情况出现
+                for c in list(pos): # 开始计算 pos为当前路径的新一步attn中的top 5得分分布
                     if c == 0:
                         Pb[l] += lpz[i][0] * (Pb_prev[l] + Pnb_prev[l])
                     else:
@@ -643,7 +685,7 @@ class E2E(torch.nn.Module):
                             hyps_ctc[l_plus]['rnnlm_prev'] = rnnlm_state
                             hyps_ctc[l_plus]['rnnlm_score'] = hyp['rnnlm_score'] + float(local_lm_scores[0, c].data)
                             hyps_ctc[l_plus]['att_score'] = hyp['att_score'] \
-                                                            + float(local_att_scores[0, c].data)
+                                                            + float(local_att_scores[0, c].data) # 累计概率
                             hyps_ctc[l_plus]['cur_att'] = float(local_att_scores[0, c].data)
                             hyps_ctc[l_plus]['cache'] = new_cache
                             hyps_ctc[l_plus]['precache'] = hyp['cache']
@@ -662,7 +704,7 @@ class E2E(torch.nn.Module):
                         if l_plus not in hyps:
                             Pb[l_plus] += lpz[i][0] * (Pb_prev[l_plus] + Pnb_prev[l_plus])
                             Pnb[l_plus] += lpz[i][c] * Pnb_prev[l_plus]
-            #total_copy += time.time() - start
+            #total_copy += time.time() - start // 下面这个循环是 整合每条路径的各种分数
             for l in hyps_ctc.keys():
                 if Pb[l] != 0 or Pnb[l] != 0:
                     hyps_ctc[l]['ctc_score'] = np.log(Pb[l] + Pnb[l])
@@ -675,10 +717,10 @@ class E2E(torch.nn.Module):
                                        + recog_args.ctc_weight * hyps_ctc[l]['ctc_score'] + \
                                        recog_args.penalty * (len(hyps_ctc[l]['yseq'])) + \
                                        recog_args.lm_weight * hyps_ctc[l]['rnnlm_score']
-            Pb_prev = Pb
-            Pnb_prev = Pnb
-            Pb = Counter()
-            Pnb = Counter()
+            Pb_prev = Pb #重置
+            Pnb_prev = Pnb #重置
+            Pb = Counter() #重置
+            Pnb = Counter() #重置
             hyps1 = sorted(hyps_ctc.items(), key=lambda x: x[1]['local_score'], reverse=True)[:beam]
             hyps1 = dict(hyps1)
             hyps2 = sorted(hyps_ctc.items(), key=lambda x: x[1]['att_score'], reverse=True)[:beam]
@@ -691,7 +733,8 @@ class E2E(torch.nn.Module):
             for key in hyps2.keys():
                 if key not in hyps:
                     hyps[key] = hyps2[key]
-        hyps = sorted(hyps.items() , key=lambda x: x[1]['score'], reverse=True)[:beam]
+            # 没条路径此时没有 pos\ tmp_cache\ tmp_att
+        hyps = sorted(hyps.items() , key=lambda x: x[1]['score'], reverse=True)[:beam] #剪枝
         hyps = dict(hyps)
         logging.info('input lengths: ' + str(h.size(0)))
         logging.info('max output length: ' + str(maxlen))
@@ -735,13 +778,13 @@ class E2E(torch.nn.Module):
 
 
     def compute_hyps(self, current_hyps, curren_frame,total_frame,enc_output, hat_att, enc_mask, chunk=True):
-        for length, hyps_t in current_hyps.items():
-            ys_mask = subsequent_mask(length).unsqueeze(0).cuda()
+        for length, hyps_t in current_hyps.items():#相同长度的一起 go for a step
+            ys_mask = subsequent_mask(length).unsqueeze(0) #.cuda() #上三角mask
             ys_mask4use = ys_mask.repeat(len(hyps_t), 1, 1)
 
             # print(ys_mask4use.shape)
-            l_id = [hyp_t['yseq'] for hyp_t in hyps_t]
-            ys4use = torch.tensor(l_id).cuda()
+            l_id = [hyp_t['yseq'] for hyp_t in hyps_t] # yseq是当前的y序列
+            ys4use = torch.tensor(l_id) # .cuda()
             enc_output4use = enc_output.repeat(len(hyps_t), 1, 1)
             if hyps_t[0]["cache"] is None:
                 cache4use = None
@@ -771,31 +814,31 @@ class E2E(torch.nn.Module):
                                             self.left_window, right_window)
                 partial_mask4use.append(partial_mask)
 
-            partial_mask4use = torch.stack(partial_mask4use).cuda().squeeze(1)
+            partial_mask4use = torch.stack(partial_mask4use).squeeze(1)#.cuda().squeeze(1)
             local_att_scores_b, new_cache_b = self.decoder.forward_one_step(ys4use, ys_mask4use,
-                                                                            enc_output4use, partial_mask4use, cache4use)
+                                                                            enc_output4use, partial_mask4use, cache4use) # attn decoder go for a step
             for idx, hyp_t in enumerate(hyps_t):
                 hyp_t['tmp_cache'] = [new_cache_b[decode_num][idx].unsqueeze(0)
                                       for decode_num in range(len(new_cache_b))]
                 hyp_t['tmp_att'] = local_att_scores_b[idx].unsqueeze(0)
                 hat_att[hyp_t['seq']] = {}
-                hat_att[hyp_t['seq']]['cache'] = hyp_t['tmp_cache']
+                hat_att[hyp_t['seq']]['cache'] = hyp_t['tmp_cache'] # decoder的状态
                 hat_att[hyp_t['seq']]['att_scores'] = hyp_t['tmp_att']
 
-    def get_ctchyps2compute(self,hyps,hyps_ctc,current_frame):
+    def get_ctchyps2compute(self,hyps,hyps_ctc,current_frame): # 把ctc的候选加到hyps ？
         tmp2 = {}
         for l, hyp in hyps.items():
             l_id = hyp['yseq']
             l_end = l_id[-1]
-            if "pos" not in hyp:
+            if "pos" not in hyp: #候选token的分布
                 continue
-            if 0 in hyp['pos'] or l_end in hyp['pos']:
+            if 0 in hyp['pos'] or l_end in hyp['pos']:# 候选里面有blank/eos/sos  或者 候选里面有和上一个字一样的
                 #l_minus = ' '.join(l.split()[:-1])
                 #if l_minus in hat_att:
                 #    hyps[l]['tmp_cur_new_cache'] = hat_att[l_minus]['cache']
                 #    hyps[l]['tmp_cur_att_scores'] = hat_att[l_minus]['att_scores']
                 #    continue
-                if l not in hyps_ctc and l_end != self.eos:
+                if l not in hyps_ctc and l_end != self.eos: # 
                     tmp2[l] = {'yseq': l_id}
                     tmp2[l]['seq'] = l
                     tmp2[l]['rnnlm_prev'] = hyp['rnnlm_prev']
@@ -808,10 +851,10 @@ class E2E(torch.nn.Module):
 
     def compute_hyps_ctc(self,hyps_ctc_cluster,total_frame,enc_output, hat_att, enc_mask, chunk=True):
         for length, hyps_t in hyps_ctc_cluster.items():
-            ys_mask = subsequent_mask(length - 1).unsqueeze(0).cuda()
+            ys_mask = subsequent_mask(length - 1).unsqueeze(0)#.cuda()
             ys_mask4use = ys_mask.repeat(len(hyps_t), 1, 1)
-            l_id = [hyp_t['yseq'][:-1] for hyp_t in hyps_t]
-            ys4use = torch.tensor(l_id).cuda()
+            l_id = [hyp_t['yseq'][:-1] for hyp_t in hyps_t] # 取消掉上一步得到的最后一个字，因为可能是伪尖峰出的字，且该字那时候的置信度不高，现在有更多的encoder特征，置信度更高
+            ys4use = torch.tensor(l_id)#.cuda()
             enc_output4use = enc_output.repeat(len(hyps_t), 1, 1)
             if "precache" not in hyps_t[0] or hyps_t[0]["precache"] is None:
                 cache4use = None
@@ -837,7 +880,7 @@ class E2E(torch.nn.Module):
                     partial_mask = trigger_mask(1, total_frame, align_tensor, self.left_window, right_window)
                 partial_mask4use.append(partial_mask)
 
-            partial_mask4use = torch.stack(partial_mask4use).cuda().squeeze(1)
+            partial_mask4use = torch.stack(partial_mask4use).squeeze(1) #.cuda().squeeze(1)
 
             local_att_scores_b, new_cache_b = \
                 self.decoder.forward_one_step(ys4use, ys_mask4use,
