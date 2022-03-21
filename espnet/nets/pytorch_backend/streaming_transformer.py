@@ -496,12 +496,12 @@ class E2E(torch.nn.Module):
 
         if train_args.chunk:
             s = np.arange(0, seq_len, train_args.chunk_size)
-            mask = adaptive_enc_mask(seq_len, s).unsqueeze(0) # chunk mask
+            mask = adaptive_enc_mask(seq_len, s).unsqueeze(0) # 制作 chunk mask， chunk size 32
         else:
             mask = turncated_mask(1, seq_len, train_args.left_window, train_args.right_window)
         enc_output = self.encode(x, mask).unsqueeze(0)
         lpz = torch.nn.functional.softmax(self.ctc.ctc_lo(enc_output), dim=-1) #ctc 得分 分布
-        lpz = lpz.squeeze(0)
+        lpz = lpz.squeeze(0) # shape torch.Size([265, 5002]), 每一行的和为 1.0
 
         h = enc_output.squeeze(0)
 
@@ -542,7 +542,7 @@ class E2E(torch.nn.Module):
         vy.unsqueeze(1)
         total_copy = time.time() - time.time()
         samelen = 0
-        hat_att = {} #保存：ctc出现非blank节点的路径
+        hat_att = {} #保存 不同chunk 的 候选路径，不会被重置， 都是一些走过atten的路径
         if mask is not None:
             chunk_pos = set(np.array(mask.sum(dim=-1))[0])
             for i in chunk_pos:
@@ -656,9 +656,9 @@ class E2E(torch.nn.Module):
                             if len(hyps_ctc[l]["yseq"]) > 1:
                                 hyps_ctc[l]["end"] = True
                             hyps_ctc[l]['last_time'] = []
-                            hyps_ctc[l]['att_score'] = hyp['att_score']
+                            hyps_ctc[l]['att_score'] = hyp['att_score']#当前句子本身的att分数
                             hyps_ctc[l]['cur_att'] = 0
-                            hyps_ctc[l]['cache'] = hyp['cache']
+                            hyps_ctc[l]['cache'] = hyp['cache']#当前句子本身的atten状态
 
                         hyps_ctc[l]['prev_score'] = hyp['prev_score']
                         hyps_ctc[l]['preatt_score'] = hyp['preatt_score']
